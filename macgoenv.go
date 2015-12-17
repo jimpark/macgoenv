@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
+	"github.com/DHowett/go-plist"
 	"log"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 )
 
@@ -19,21 +21,62 @@ func isDir(path string) bool {
 	return false
 }
 
-func createEnvPlistContent(vars map[string]string) string {
-	var buf bytes.Buffer
-	buf.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-`)
+func isFile(path string) bool {
+	stat, err := os.Stat(path)
+	if err == nil {
+		return !stat.IsDir()
+	}
+	return false
+}
 
-	for key, value := range vars {
-		buf.WriteString(fmt.Sprintf("\t<key>%s</key>\n", key))
-		buf.WriteString(fmt.Sprintf("\t<string>%s</string>\n", value))
+type envPlist struct {
+	Label            string   `plist:"Label"`
+	ProgramArguments []string `plist:"ProgramArguments"`
+	RunAtLoad        bool     `plist:"RunAtLoad"`
+}
+
+func readEnvPlistContent(path string) (result map[string]string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
 	}
 
-	buf.WriteString("</dict>\n</plist>\n")
-	return buf.String()
+	defer f.Close()
+
+	dec := plist.NewDecoder(f)
+	data := new(envPlist)
+	err = dec.Decode(data)
+
+	if err != nil {
+		return
+	}
+
+	r, err := regexp.Compile(`launchctl\s+setenv\s+(\w+)\s+(.*)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	result = make(map[string]string)
+	for _, s := range data.ProgramArguments {
+		m := r.FindStringSubmatch(s)
+		if len(m) == 3 {
+			result[m[1]] = m[2]
+		}
+	}
+
+	return
+}
+
+func createEnvPlistContent(vars map[string]string) *envPlist {
+	result := new(envPlist)
+	result.Label = "my.startup"
+	result.RunAtLoad = true
+	result.ProgramArguments = []string{"sh", "-c"}
+
+	for key, value := range vars {
+		result.ProgramArguments = append(result.ProgramArguments, fmt.Sprintf("launchctl setenv %s %s", key, value))
+	}
+	return result
 }
 
 func main() {
@@ -47,19 +90,34 @@ func main() {
 		log.Fatal(err)
 	}
 
-	macosxdir := filepath.Join(usr.HomeDir, ".MacOSX")
+	macosxdir := filepath.Join(usr.HomeDir, "Library", "LaunchAgents")
 
 	if !isDir(macosxdir) {
-		err := os.Mkdir(macosxdir, 0700)
+		err := os.MkdirAll(macosxdir, 0700)
 		if err != nil {
 			fmt.Printf("Error: Cannot create directory %s.\n", macosxdir)
 			log.Fatal(err)
 		}
 	}
 
-	env := map[string]string{
-		"GOPATH": os.Getenv("GOPATH"),
+	var env map[string]string
+
+	plistPath := filepath.Join(macosxdir, "environment.plist")
+
+	if isFile(plistPath) {
+		env, err = readEnvPlistContent(plistPath)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
+
+	if env == nil {
+		env = map[string]string{
+			"GOPATH": os.Getenv("GOPATH"),
+		}
+	}
+
+	fmt.Printf("GOPATH = %s\n", env["GOPATH"])
 
 	if len(env["GOPATH"]) == 0 {
 		reader := bufio.NewReader(os.Stdin)
@@ -69,21 +127,29 @@ func main() {
 
 	contents := createEnvPlistContent(env)
 
-	plistPath := filepath.Join(macosxdir, "environment.plist")
 	f, err := os.Create(plistPath)
 	if err != nil {
 		fmt.Printf("Error: could not create '%s' file.\n", plistPath)
 		log.Fatal(err)
 	}
 	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	_, err = w.WriteString(contents)
+	encoder := plist.NewEncoderForFormat(f, plist.AutomaticFormat)
 
 	if err != nil {
 		log.Fatal(err)
 	}
-	w.Flush()
+	encoder.Encode(contents)
+
 	fmt.Printf("Created '%s' file.\n", plistPath)
-	fmt.Println("Log out and log back in to take effect.")
+
+	fmt.Println("Running launchctl to apply settings.")
+	cmd := exec.Command("launchctl", "unload", plistPath)
+	err = cmd.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cmd = exec.Command("launchctl", "load", plistPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
